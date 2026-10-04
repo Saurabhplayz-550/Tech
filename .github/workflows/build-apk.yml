@@ -1,0 +1,95 @@
+name: Build APK from ZIP
+
+on:
+  push:
+    paths:
+      - "*.zip"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find and extract the newest ZIP
+        id: extract
+        run: |
+          ZIP=$(ls -t ./*.zip 2>/dev/null | head -n 1 || true)
+          if [ -z "$ZIP" ]; then
+            echo "::error::Repo ke root me koi .zip file nahi mili"
+            exit 1
+          fi
+          echo "Using $ZIP"
+          mkdir -p "$RUNNER_TEMP/src"
+          unzip -q "$ZIP" -d "$RUNNER_TEMP/src"
+          SETTINGS=$(find "$RUNNER_TEMP/src" -maxdepth 3 \( -name settings.gradle.kts -o -name settings.gradle \) | head -n 1)
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::Zip me settings.gradle(.kts) nahi mila"
+            exit 1
+          fi
+          ROOT=$(dirname "$SETTINGS")
+          echo "Project root: $ROOT"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Pick Gradle version
+        id: gradlever
+        run: |
+          PROPS="${{ steps.extract.outputs.root }}/gradle/wrapper/gradle-wrapper.properties"
+          VER=9.3.1
+          if [ -f "$PROPS" ]; then
+            V=$(grep -oP 'gradle-\K[0-9.]+(?=-(bin|all)\.zip)' "$PROPS" | head -n 1 || true)
+            [ -n "$V" ] && VER="$V"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.gradlever.outputs.version }}
+
+      - name: Build debug APK
+        working-directory: ${{ steps.extract.outputs.root }}
+        run: |
+          if [ -x ./gradlew ]; then
+            ./gradlew assembleDebug --stacktrace --no-daemon
+          else
+            gradle assembleDebug --stacktrace --no-daemon
+          fi
+
+      - name: Collect APK
+        id: apk
+        run: |
+          mkdir -p out
+          find "${{ steps.extract.outputs.root }}" -path '*/build/outputs/apk/debug/*.apk' -exec cp {} out/ \;
+          ls -la out
+          APK=$(ls out/*.apk | head -n 1)
+          mv "$APK" out/TechChat-AI-debug.apk
+          echo "path=out/TechChat-AI-debug.apk" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TechChat-AI-debug-apk
+          path: out/TechChat-AI-debug.apk
+
+      - name: Publish APK to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "build-${{ github.run_number }}" "${{ steps.apk.outputs.path }}" \
+            --title "TechChat AI build #${{ github.run_number }}" \
+            --notes "Auto-built from zip (commit ${GITHUB_SHA::7})"
